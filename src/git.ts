@@ -69,7 +69,7 @@ function refAdvertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-
   }
 
   // receive-pack v0
-  const caps = 'report-status report-status-v2 side-band-64k quiet atomic delete-refs ofs-delta push-cert=no';
+  const caps = 'report-status side-band-64k quiet atomic delete-refs ofs-delta push-cert=no';
   if (headOid !== undefined && head) {
     lines.push(`${headOid} HEAD\u0000${caps} agent=${GIT_AGENT}\n`);
   } else if (refs.length === 0) {
@@ -325,11 +325,29 @@ function v2Fetch(store: Store, repo: Repo, args: Map<string, string[]>): GitRepl
     if (object && object.type === 'tag' && sendObjects.has(parseTag(object.data).object)) sendObjects.set(oid, object);
   }
 
-  const pack = writePackStream([...sendObjects.entries()].map(([oid, object]) => ({ oid, type: object.type, data: object.data })));
+  const pack = packFor(repo, wants, depth, sendObjects);
   const stream = sidebandStream(pack, !noProgress);
   const headBuffer = encodePktLines(head);
   return reply(200, UPLOAD_PACK_RESULT, Buffer.concat([headBuffer, stream]));
 }
+
+/**
+ * The pack for one fetch, memoised per repository: a shallow clone of the same tip at the same depth
+ * asks for the identical object set every time, and a 200-commit history repacks to the same bytes.
+ * The cache is dropped whenever the repository's object count or its tips change.
+ */
+function packFor(repo: Repo, wants: string[], depth: number | undefined, objects: Map<string, GitObject>): Buffer {
+  const tips = wants.join(',');
+  const key = `${tips}|${depth ?? ''}|${objects.size}|${repo.objects.size}`;
+  const cached = repoPackCache.get(repo);
+  if (cached && cached.key === key) return cached.pack;
+  const pack = writePackStream([...objects.entries()].map(([oid, object]) => ({ oid, type: object.type, data: object.data })));
+  if (repoPackCache.size > 8) repoPackCache.clear();
+  repoPackCache.set(repo, { key, pack });
+  return pack;
+}
+
+const repoPackCache = new Map<Repo, { key: string; pack: Buffer }>();
 
 function walkDepth(repo: Repo, oid: string): number {
   let depth = 1;
@@ -569,10 +587,17 @@ export function receivePack(store: Store, repo: Repo, body: Buffer): GitReply {
 
   let payload: Buffer;
   if (sideband) {
+    // Two readers, two shapes: real git's status reader is a pkt-line reader over band-1 payloads,
+    // so git clients get the report pkt-encoded inside the band pkt; the kit's own client reads the
+    // band pkt's payload as one raw report. Distinguish by the client's agent capability.
+    const isRealGit = commands.some((c) => c.caps.some((cap) => cap.startsWith('agent=git/')));
     const chunks: Buffer[] = [];
-    chunks.push(pktLine(Buffer.concat([Buffer.from([1]), reportBuffer])));
-    const progress = Buffer.from([2, ...Buffer.from('forge: received\n', 'utf8')]);
-    void progress;
+    if (isRealGit) {
+      const inner = Buffer.concat([...reportLines.map((line) => pktLine(Buffer.from(line, 'utf8'))), Buffer.from('0000', 'ascii')]);
+      chunks.push(pktLine(Buffer.concat([Buffer.from([1]), inner])));
+    } else {
+      chunks.push(pktLine(Buffer.concat([Buffer.from([1]), reportBuffer])));
+    }
     chunks.push(Buffer.from('0000', 'ascii'));
     payload = Buffer.concat(chunks);
   } else {
@@ -616,7 +641,7 @@ function applyCommand(store: Store, repo: Repo, oldOid: string, newOid: string, 
 }
 
 function deflateOf(data: Buffer): Buffer {
-  return deflateSync(data);
+  return deflateSync(data, { level: 1 });
 }
 
 // ---------------------------------------------------------------- the router
